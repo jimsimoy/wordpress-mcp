@@ -71,6 +71,31 @@ surfaces as a misleading "Incorrect username or password".
 
 Site configs live in `configs/*.json` and are gitignored. Keep it that way.
 
+## Git helpers
+
+```
+./git-pull-current.sh              pull the current branch, then show status
+./git-push-current.sh              scan, then push the current branch
+./git-commit.sh "message"          scan the message, stage all, commit, push
+```
+
+**This repo is public, so the push and commit scripts scan before they act.** They check the
+outgoing diff *and* the commit messages for credentials, private keys, `user:pass` pairs, `.local`
+hostnames, IPs and email addresses, and refuse to push if anything matches. A force-push cannot
+unpublish a mistake — old objects stay fetchable by SHA — so the only reliable moment to catch one
+is before it leaves.
+
+For names that must never appear here but that would themselves be a leak if hardcoded in a public
+script, create `.git-deny-patterns` — one regex per line. It is gitignored and never ships.
+
+```
+# .git-deny-patterns
+some-client-name
+internal-project-code
+```
+
+False positives get a narrow exception in `GUARD_ALLOW` in `git-guard.sh`. Don't disable the scan.
+
 ## Setup
 
 ```bash

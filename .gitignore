@@ -6,3 +6,7 @@ venv/
 # Site configs contain credentials — never commit these.
 configs/*.json
 !configs/.gitkeep
+
+# Local deny-list for the pre-push scan. Holds names that must never appear in
+# this public repo — and would themselves be a leak if committed here.
+.git-deny-patterns

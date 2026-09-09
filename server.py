@@ -62,7 +62,60 @@ def err(message: str) -> CallToolResult:
 
 # ── Server setup ───────────────────────────────────────────────────────────────
 
-server = Server("wordpress-mcp")
+SERVER_INSTRUCTIONS = """\
+This server writes to real WordPress sites. One server instance = one site; the config
+decides whether that is local dev, staging, or live. Read this before your first call.
+
+## Pacing — applies to staging and live, not local dev
+- Prove a call chain on local dev BEFORE running it against staging or live.
+- State the request count up front, before you run anything remote.
+- Space calls several seconds apart. No parallel calls to the same site, no rapid loops.
+- Never retry-loop on failure. Stop and report it.
+- Report the actual number of requests sent to each remote site when you finish.
+
+## Elementor: use wp_deploy_elementor_page
+`_elementor_data` is post meta. A REST write REPLACES it wholesale, and WordPress keeps
+NO revision history for post meta, so an overwrite cannot be undone.
+
+- **Use `wp_deploy_elementor_page`.** It backs up first, uploads and de-duplicates media,
+  remaps every attachment id and URL for the target site, writes, then clears the cache.
+- Writing `_elementor_data` yourself through `wp_update_post`'s `meta` is guarded: it is
+  REFUSED when the page already has a layout. Pass `backup_dir` to save the current
+  layout first. Only set `allow_unbacked` when you have already taken a backup.
+- **Never blanket-overwrite a page you did not generate in full.** Pages drift: someone
+  edits them in the Elementor UI and the change is never back-ported to whatever source
+  file you are deploying from. A full-page write silently destroys that work. Read the
+  live layout, change only the nodes you mean to change, write it back, then diff the
+  before/after tree and confirm the change count is exactly what you intended.
+
+## The build/deploy sequence that works
+1. Build and verify on local dev first — never author straight onto a remote site.
+2. `wp_get_elementor_page` to read current state; keep it as your baseline.
+3. `wp_deploy_elementor_page` with a payload file, `backup_dir`, and `source_host` so
+   media ids and URLs are rewritten for the target.
+4. `wp_clear_elementor_cache` — required, see below.
+5. Re-fetch the RENDERED page and verify the change is actually visible. A correct
+   database value is not evidence the page changed.
+
+## Traps that cost real time
+- **Caching.** Elementor caches generated CSS per post AND caches rendered element HTML
+  in post meta. After a correct write the page can keep serving the OLD markup with no
+  error anywhere. `wp_clear_elementor_cache` clears both — always call it after a write.
+  Host-level caches (Varnish, and any caching plugin) sit in front of that and need
+  purging separately.
+- **`unfiltered_html`.** Without that capability WordPress runs your payload through
+  `kses`, silently stripping `<script>` and `<svg>`. The page still saves and still
+  renders — just missing those elements. Check the user's capabilities before writing
+  markup.
+- **Attachment ids are per-site.** A layout carries `{"id": N, "url": "..."}` for every
+  image. Move it without remapping and each image points at whatever id N happens to be
+  on the target. `wp_deploy_elementor_page` handles this; a raw meta write does not.
+- **WordPress does not de-duplicate uploads.** The same filename twice gives you two
+  attachments. Use `wp_find_media_by_filename` and reuse before uploading.
+- **Deletes take `force`.** `force=true` skips the trash and is permanent.
+"""
+
+server = Server("wordpress-mcp", instructions=SERVER_INSTRUCTIONS)
 _client: WPClient | None = None
 
 
@@ -231,7 +284,27 @@ async def list_tools() -> list[Tool]:
                             "'_elementor_edit_mode' ('builder'), "
                             "'_elementor_template_type' ('wp-page'), "
                             "'_elementor_page_settings' (object; accepts 'custom_css', 'hide_title'). "
-                            "Pair with template='elementor_canvas' for a page with no theme header/footer."
+                            "Pair with template='elementor_canvas' for a page with no theme header/footer. "
+                            "NOTE: writing '_elementor_data' to a page that already has a layout is "
+                            "REFUSED unless you pass backup_dir (or allow_unbacked). Prefer "
+                            "wp_deploy_elementor_page, which backs up and remaps media for you."
+                        ),
+                    },
+                    "backup_dir": {
+                        "type": "string",
+                        "description": (
+                            "Directory to save the page's current Elementor layout to before "
+                            "overwriting it. Required when meta['_elementor_data'] would replace an "
+                            "existing layout — post meta has no revision history, so the overwrite "
+                            "is otherwise unrecoverable. The saved path comes back as '_backup_file'."
+                        ),
+                    },
+                    "allow_unbacked": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Skip the backup requirement. Only set this when you have already taken "
+                            "a backup of the current layout yourself."
                         ),
                     },
                 },
@@ -589,14 +662,19 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             data      = client.update_post(post_type, post_id, **arguments)
             if isinstance(data, dict) and data.get("code"):
                 return err(data.get("message", str(data)))
-            return ok({
+            out = {
                 "id":      data.get("id"),
                 "slug":    data.get("slug"),
                 "status":  data.get("status"),
                 "title":   (data.get("title") or {}).get("rendered", ""),
                 "link":    data.get("link"),
                 "modified": data.get("modified"),
-            })
+            }
+            # set when this write replaced an existing Elementor layout — tell the caller
+            # where the previous one was saved, so the write is actually reversible.
+            if data.get("_backup_file"):
+                out["backup_file"] = data["_backup_file"]
+            return ok(out)
 
         elif name == "wp_create_post":
             post_type = arguments.pop("post_type", "pages")
@@ -850,9 +928,12 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 settings["custom_css"] = payload["custom_css"]
             settings.setdefault("hide_title", "yes")
 
+            # allow_unbacked: step 1 above already wrote `backup` for this page, so the
+            # client-side guard would only re-read the layout to prove what we just saved.
             written = client.set_elementor(post_type, post_id, remapped, page_settings=settings,
                                            template=arguments.get("template", "elementor_canvas"),
-                                           status=arguments.get("status"))
+                                           status=arguments.get("status"),
+                                           allow_unbacked=True)
             if isinstance(written, dict) and written.get("code"):
                 return err(f"Write failed (backup kept at {backup}): {written.get('message')}")
 

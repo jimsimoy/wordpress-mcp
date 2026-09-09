@@ -246,11 +246,62 @@ class WPClient:
                                   status="any" if post_type != "posts" else None)
         return results[0] if results else None
 
-    def update_post(self, post_type: str, post_id: int, **fields) -> dict:
+    def _guard_elementor_overwrite(self, post_type, post_id, meta, backup_dir, allow_unbacked):
+        """Refuse to replace an existing Elementor layout with no way back.
+
+        A REST write replaces `_elementor_data` wholesale, and WordPress keeps no
+        revision history for post meta — so an overwrite is unrecoverable. Both
+        `update_post(meta=...)` and `set_elementor()` funnel through `update_post`,
+        so the check lives here rather than on each caller; guarding only the
+        Elementor helper would leave the raw-meta route wide open.
+
+        Returns `(backup_file, refusal)`. When `refusal` is set the caller must
+        return it untouched instead of writing.
+        """
+        if not isinstance(meta, dict) or not meta.get("_elementor_data"):
+            return None, None                    # not an Elementor write, nothing to guard
+        if allow_unbacked and not backup_dir:
+            return None, None                    # caller asserts it has already backed up
+
+        current = self.get_elementor(post_type, post_id)
+        if isinstance(current, dict) and current.get("code"):
+            return None, current                 # could not read — surface that, do not write
+        existing = current.get("data")
+        if existing in (None, "", "[]", []):
+            return None, None                    # blank page, nothing to lose
+
+        if backup_dir:
+            from elementor_deploy import backup_layout
+            return backup_layout(post_id, existing, current.get("page_settings"),
+                                 current.get("template"), backup_dir), None
+
+        return None, {
+            "code": "refused_unbacked_overwrite",
+            "message": (
+                f"Refusing to overwrite: {post_type}/{post_id} already has an Elementor layout "
+                f"({len(existing) if isinstance(existing, str) else 'non-empty'} bytes) and this "
+                "write would replace it permanently — WordPress keeps no revisions of post meta. "
+                "Use wp_deploy_elementor_page (it backs up automatically), or pass backup_dir to "
+                "save the current layout first. allow_unbacked=True skips this check and should "
+                "only be used when you have already taken a backup yourself."
+            ),
+        }
+
+    def update_post(self, post_type: str, post_id: int, backup_dir: str = None,
+                    allow_unbacked: bool = False, **fields) -> dict:
         allowed = {"title", "content", "excerpt", "status", "slug", "date",
                    "featured_media", "meta", "parent", "menu_order", "template"}
         payload = {k: v for k, v in fields.items() if k in allowed and v is not None}
-        return self.request("POST", f"/wp-json/wp/v2/{post_type}/{post_id}", payload=payload)
+
+        backup_file, refusal = self._guard_elementor_overwrite(
+            post_type, post_id, payload.get("meta"), backup_dir, allow_unbacked)
+        if refusal:
+            return refusal
+
+        result = self.request("POST", f"/wp-json/wp/v2/{post_type}/{post_id}", payload=payload)
+        if backup_file and isinstance(result, dict) and not result.get("code"):
+            result = {**result, "_backup_file": backup_file}
+        return result
 
     def create_post(self, post_type: str, **fields) -> dict:
         allowed = {"title", "content", "excerpt", "status", "slug", "date",
@@ -282,7 +333,14 @@ class WPClient:
         }
 
     def set_elementor(self, post_type: str, post_id: int, layout, page_settings: dict = None,
-                      template: str = None, status: str = None) -> dict:
+                      template: str = None, status: str = None,
+                      backup_dir: str = None, allow_unbacked: bool = False) -> dict:
+        """Write a layout to a page.
+
+        Overwriting an existing layout is refused unless `backup_dir` is given (the
+        current layout is saved there first) or `allow_unbacked=True`. Prefer
+        `wp_deploy_elementor_page`, which backs up and remaps media for you.
+        """
         meta = {
             "_elementor_data": layout if isinstance(layout, str) else json.dumps(layout),
             "_elementor_edit_mode": "builder",
@@ -295,7 +353,8 @@ class WPClient:
             fields["template"] = template
         if status is not None:
             fields["status"] = status
-        return self.update_post(post_type, post_id, **fields)
+        return self.update_post(post_type, post_id, backup_dir=backup_dir,
+                                allow_unbacked=allow_unbacked, **fields)
 
     def clear_elementor_cache(self) -> dict:
         """Elementor caches generated CSS per post and never re-checks it

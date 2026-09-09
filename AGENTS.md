@@ -27,6 +27,54 @@ the thing being verified genuinely can't be reproduced locally.
 
 ---
 
+## Start here: writing an Elementor page
+
+**Use `wp_deploy_elementor_page`.** It is the only path that does the whole job: backs up the
+current layout, uploads media idempotently, remaps every attachment id and URL for the target
+site, writes, and clears the cache. Hand-rolling those steps is how pages get broken.
+
+**Writing `_elementor_data` yourself is guarded.** `wp_update_post` with
+`meta['_elementor_data']` — and the `set_elementor()` client method behind it — now **refuse**
+when the target already has a layout:
+
+```
+refused_unbacked_overwrite
+```
+
+Post meta has no revision history, so that write would be unrecoverable. To proceed either pass
+`backup_dir` (the current layout is saved there first and the path comes back as `backup_file`),
+or pass `allow_unbacked` if you have already taken a backup yourself. A page with no existing
+layout is not guarded — there is nothing to lose.
+
+**Never blanket-overwrite a page you did not generate in full.** This is the failure that
+motivated the guard. Pages drift: a person edits them in the Elementor UI, and that edit is never
+back-ported to whatever build script or payload file you are deploying from. Regenerating and
+writing the whole page silently destroys their work, and the diff is invisible unless you look for
+it. A real case: a page had accumulated a mobile CSS pass, responsive settings on eight widgets,
+and an extra widget inside each of four cards — none of it in the source that a full deploy would
+have pushed.
+
+So, for a change to an existing page:
+
+1. `wp_get_elementor_page` — read the live tree. **That is your source of truth, not your repo.**
+2. Mutate only the nodes you actually mean to change.
+3. Write it back (`backup_dir` set, or via the deploy tool).
+4. **Diff the before/after tree and assert the change count.** "142 elements before, 142 after,
+   exactly 2 changes" is the standard to hold yourself to. If the count surprises you, stop.
+
+## The sequence that works, local → staging
+
+1. **Build and verify on local dev.** Never author straight onto a remote site.
+2. Verify on the **rendered page in a real browser**, not the write response and not the database
+   value. A correct row is not a correct page.
+3. Read the target's current state and keep the backup.
+4. Deploy with `source_host` set so media ids and URLs are rewritten for the target.
+5. `wp_clear_elementor_cache`, then purge any host-level cache (Varnish, caching plugins).
+6. Re-fetch the rendered remote page with a cache-buster and assert on the HTML.
+7. Report the actual request count for the remote site.
+
+---
+
 ## What this tool has actually been used for
 
 Not aspirational — each of these has been done end to end against real WordPress installs.
@@ -60,13 +108,20 @@ the target. `wp_deploy_elementor_page` handles this; if you write the meta yours
 and three attachments. Look up by filename and reuse before uploading, or repeat deploys quietly
 litter the media library.
 
-**Elementor caches its generated CSS per post and never re-checks it.**
-`Post_CSS::is_update_required()` never returns true, so custom CSS written over REST is stored but
-never reaches the page until the cache is cleared. `_elementor_css` is not REST-registered, so
-`wp/v2` cannot clear it — use Elementor's own `DELETE /elementor/v1/cache`.
+**Elementor caches in two places, and both will serve you stale output.**
+It caches generated CSS per post — `Post_CSS::is_update_required()` never returns true, so custom
+CSS written over REST is stored but never reaches the page — *and* it caches rendered element HTML
+in post meta (`_elementor_element_cache`). The second one is the nastier: after a completely
+correct write to `_elementor_data`, the page keeps serving the OLD markup, with the database
+showing the new value and no error anywhere.
 
-**Take a backup before overwriting a layout.** There is no undo. Read the existing
-`_elementor_data` and keep it before you write.
+Neither is REST-registered, so `wp/v2` cannot clear them; Elementor's own
+`DELETE /elementor/v1/cache` clears both, which is what `wp_clear_elementor_cache` calls. Note
+that PHP-side `files_manager->clear_cache()` does **not** clear the element cache — if you are
+scripting outside this tool, delete `_elementor_element_cache` explicitly.
+
+**Take a backup before overwriting a layout.** There is no undo. This is now enforced rather
+than advised — see "Start here" above.
 
 ## Auth on managed hosts — the two traps
 

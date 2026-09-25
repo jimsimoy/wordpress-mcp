@@ -9,6 +9,10 @@
   "wp_user":         "admin_username",
   "wp_app_password": "xxxx xxxx xxxx xxxx xxxx xxxx",
 
+  "_safety_rails": "Optional. read_only refuses every non-GET request; request_delay is the minimum seconds between requests (login included).",
+  "read_only":     false,
+  "request_delay": 0,
+
   "_cookie_auth_fields": "Only needed when wp_auth_mode = cookie",
   "wp_admin_url":   "https://your-site.com/wp-admin",
   "wp_password":    "your-wp-login-password",

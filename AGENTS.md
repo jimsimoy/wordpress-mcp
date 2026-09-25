@@ -87,6 +87,9 @@ Not aspirational — each of these has been done end to end against real WordPre
 - **Driving a site behind HTTP Basic auth** (managed hosts often put staging behind htpasswd).
 - **Logging into a site that hides `wp-login.php`** (WPS Hide Login and similar).
 - **Reading a user's capabilities before writing**, to predict whether markup will be sanitised.
+- **Changing a plugin's settings over its own REST routes**, with the read-modify-write, counter and
+  line-break handling in an adapter (`wp_plugin_settings_update`), proven on local dev over the real MCP
+  protocol before it was pointed at anything remote.
 
 ## Things worth knowing before you start
 
@@ -123,6 +126,22 @@ scripting outside this tool, delete `_elementor_element_cache` explicitly.
 **Take a backup before overwriting a layout.** There is no undo. This is now enforced rather
 than advised — see "Start here" above.
 
+**Plugin settings routes usually REPLACE, they do not merge.** Many rebuild the stored object from the
+data you POST plus the plugin's *defaults*, so posting only the keys you changed resets everything else
+to defaults with a 200 and no error. Read the whole object, change your keys, send the whole object
+back. Use `wp_plugin_settings_update` where an adapter exists; with `wp_rest_request`, do it yourself.
+
+**A "read" can have a side effect.** Some plugins rebuild an admin preview on GET and, for example,
+assign the next invoice number to a random order. Check the adapter's notes, and read once, not in a loop.
+
+**Text fields get sanitised in ways that change line breaks.** One plugin turns a stored `\r\n` into
+`\r<br />`; the template then runs `nl2br()` and every line break prints twice, an address with blank
+lines between its lines. A round-trip through the plugin's own settings route can therefore *introduce* a
+visual bug. Verify the rendered output, not just the save response.
+
+**Never send counters or other computed fields back.** GET responses often include read-only values
+(next invoice number, totals). Posting them back can move a counter.
+
 ## Auth on managed hosts — the two traps
 
 **App passwords do not work behind HTTP Basic auth.** Both use the `Authorization: Basic` header,
@@ -154,4 +173,8 @@ no login attempts, no lockout risk.*
    meta was stored. It does not mean the markup survived sanitising, the CSS cache was cleared, or
    the images resolved. Fetch the page with a cache-buster and assert on what is actually in the
    HTML.
-5. **Say how many requests you are about to make**, per the policy above, and space them.
+5. **Say how many requests you are about to make**, per the policy above, and space them. Login
+   is three requests in cookie mode. `wp_request_count` returns the exact total this server has sent,
+   and `request_delay` in the site config enforces the spacing for every tool. Put `read_only: true` on
+   any live site you only need to inspect.
+6. **`dry_run` first on `wp_plugin_settings_update`.** It is the default, and it costs only the reads.

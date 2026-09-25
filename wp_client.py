@@ -36,12 +36,52 @@ DEFAULT_USER_AGENT = (
 )
 
 
+_REST_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
+
+def normalise_rest_path(path: str) -> str:
+    """Validate a caller-supplied REST route and return it as a path under /wp-json.
+
+    Accepts "/wcdn/v1/settings" or "/wp-json/wcdn/v1/settings". Rejects anything that is not a plain
+    route on this site - a full URL, a query string (pass `params` instead), traversal, whitespace or
+    control characters - so a generic tool can never be pointed at another host or path.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path must be a non-empty string such as '/wp/v2/settings'")
+    path = path.strip()
+    if "://" in path or path.startswith("//") or "\\" in path:
+        raise ValueError("path must be a route on this site, not a URL")
+    if "?" in path or "#" in path:
+        raise ValueError("put query parameters in `params`, not in the path")
+    if any(ord(c) < 33 or ord(c) == 127 for c in path):
+        raise ValueError("path must not contain whitespace or control characters")
+    if re.search(r"%(2e|2f|5c)", path, re.IGNORECASE) or ".." in path.split("/"):
+        raise ValueError("path must not contain traversal segments")
+    if not path.startswith("/"):
+        path = "/" + path
+    if path != "/wp-json" and not path.startswith("/wp-json/"):
+        path = "/wp-json" + path
+    return path
+
+
 class WPClient:
     def __init__(self, config: dict):
         self.base  = config["wp_url"].rstrip("/")
         self._ssl  = ssl._create_unverified_context()
         self._opener = None
         self._user_agent = config.get("user_agent", DEFAULT_USER_AGENT)
+
+        # Optional safety rails, both off by default. See config.example.json.
+        #   read_only      - refuse every request that is not a GET (for live sites).
+        #   request_delay  - minimum seconds between requests, cookie-login requests included,
+        #                    so multi-request tools stay paced (AGENTS.md: no rapid-fire calls).
+        self._read_only = bool(config.get("read_only", False))
+        self._request_delay = float(config.get("request_delay", 0) or 0)
+        self._last_request_at = None
+        # Every HTTP request this client has sent, login included. Reported by the
+        # wp_request_count tool so the "state the exact number of requests you sent" policy
+        # in AGENTS.md is a lookup, not a guess.
+        self.request_count = 0
 
         auth_mode = config.get("wp_auth_mode", "app_password")
 
@@ -96,6 +136,7 @@ class WPClient:
             base_hdrs["Authorization"] = nginx_b64
 
         # GET the login page first so wordpress_test_cookie is set in the jar
+        self._before_request()
         self._opener.open(urllib.request.Request(login_url, headers=base_hdrs))
 
         login_data = urllib.parse.urlencode({
@@ -108,6 +149,7 @@ class WPClient:
 
         hdrs = {**base_hdrs, "Content-Type": "application/x-www-form-urlencoded"}
         req  = urllib.request.Request(login_url, data=login_data, headers=hdrs, method="POST")
+        self._before_request()
         try:
             with self._opener.open(req) as r:
                 final_url = r.geturl()
@@ -119,6 +161,7 @@ class WPClient:
                 "wp_password, and wp_login_url if the site hides wp-login.php."
             )
 
+        self._before_request()
         with self._opener.open(urllib.request.Request(nonce_url, headers=base_hdrs)) as r:
             nonce = r.read().decode().strip()
 
@@ -128,10 +171,35 @@ class WPClient:
 
     # ── Low-level request ──────────────────────────────────────────────────────
 
+    def _before_request(self):
+        """Count the request about to be sent and, if request_delay is set, wait until at least
+        that many seconds have passed since the previous one."""
+        if self._request_delay and self._last_request_at is not None:
+            wait = self._request_delay - (time.monotonic() - self._last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_request_at = time.monotonic()
+        self.request_count += 1
+
+    def rest(self, method: str, path: str, payload=None, params: dict = None):
+        """Generic authenticated call to any REST route on this site (plugins' own namespaces
+        included). The route is validated - see normalise_rest_path - then sent through request(),
+        so read_only, request_delay and request_count all apply."""
+        method = (method or "GET").upper()
+        if method not in _REST_METHODS:
+            raise ValueError(f"method must be one of {', '.join(_REST_METHODS)}")
+        return self.request(method, normalise_rest_path(path), payload=payload, params=params)
+
     def request(self, method: str, path: str, payload=None, params: dict = None,
                 raw_body: bytes = None, extra_headers: dict = None):
         """JSON request by default. Pass `raw_body` to send bytes as-is (media upload),
         in which case `extra_headers` must carry the right Content-Type/Disposition."""
+        if self._read_only and method.upper() != "GET":
+            raise RuntimeError(
+                f"This site's config is read_only: refusing {method.upper()} {path}. "
+                "Remove read_only from the config to allow writes."
+            )
+        self._before_request()
         url = self.base + path
         if params:
             url += "?" + urllib.parse.urlencode(params)

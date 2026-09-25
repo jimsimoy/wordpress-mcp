@@ -28,6 +28,7 @@ from mcp.types import (
 
 from wp_client import WPClient
 import elementor_deploy as ed
+from plugin_settings import adapter_slugs, get_adapter, ADAPTERS
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
@@ -531,6 +532,84 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="wp_rest_request",
+            description=(
+                "Generic authenticated call to any REST route on this site - a plugin's own namespace, or "
+                "core routes the purpose-built tools don't cover (e.g. /wp/v2/settings). Prefer a "
+                "purpose-built tool when one exists. Route only, e.g. '/wcdn/v1/settings' or "
+                "'/wp/v2/settings'; the '/wp-json' prefix is added, full URLs and query strings in the path "
+                "are refused (use `params`). CAUTION when writing: many plugin routes REPLACE the whole "
+                "stored object from what you send plus the plugin's defaults, so a partial POST can silently "
+                "reset every other setting - GET first and send the complete object back. Each call counts "
+                "as one request against the site (see AGENTS.md), and is refused for non-GET methods when "
+                "the site's config sets read_only."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "method":  {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+                    "path":    {"type": "string", "description": "REST route, e.g. '/wp/v2/settings' or '/wcdn/v1/settings'"},
+                    "params":  {"type": "object", "description": "Query-string parameters"},
+                    "payload": {"description": "JSON request body (object or array) for POST/PUT/PATCH"},
+                },
+            },
+        ),
+        Tool(
+            name="wp_plugin_settings_get",
+            description=(
+                "Read a plugin's settings through a purpose-built adapter that knows that plugin's REST "
+                "routes. Available plugins: " + "; ".join(f"'{a.slug}' = {a.title}" for a in ADAPTERS.values()) +
+                ". Call without `group` to list the groups (no request is sent). Adapters: " +
+                " | ".join(f"{a.slug}: {a.description}" for a in ADAPTERS.values())
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["plugin"],
+                "properties": {
+                    "plugin": {"type": "string", "enum": adapter_slugs()},
+                    "group":  {"type": "string", "description": "Settings group to read, e.g. 'settings' or 'templates.receipt'. Omit to list groups."},
+                    "keys":   {"type": "array", "items": {"type": "string"}, "description": "Only return these settings"},
+                },
+            },
+        ),
+        Tool(
+            name="wp_plugin_settings_update",
+            description=(
+                "Change a plugin's settings safely through its adapter: reads the current full object, "
+                "validates every key and value type against it, changes only what you asked, saves the "
+                "whole object back, and verifies the result from the plugin's own save response. "
+                "dry_run defaults to TRUE - it shows exactly what would change and writes nothing; call "
+                "again with dry_run=false to apply. `changes` maps a group to {setting: value}, e.g. "
+                "{\"settings\": {\"autoPrintDialog\": true}, \"templates.receipt\": {\"showDocumentTitle\": false}}. "
+                "Reports how many requests it sent. Plugins: " +
+                "; ".join(f"'{a.slug}' = {a.title}" for a in ADAPTERS.values())
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["plugin", "changes"],
+                "properties": {
+                    "plugin":  {"type": "string", "enum": adapter_slugs()},
+                    "changes": {"type": "object", "description": "{group: {setting: value}}; see wp_plugin_settings_get for groups and setting names"},
+                    "dry_run": {"type": "boolean", "default": True,
+                                "description": "Default true: plan only. Set false to write."},
+                    "fix_line_breaks": {"type": "boolean", "default": False,
+                                        "description": "Also repair text fields whose line breaks would print doubled "
+                                                       "(e.g. a store address with blank lines between its lines), "
+                                                       "even when no other setting in the group changes."},
+                },
+            },
+        ),
+        Tool(
+            name="wp_request_count",
+            description=(
+                "How many HTTP requests this server has sent to the site since it started (login "
+                "included). Use it to report the exact request count after working on a live or staging "
+                "site, as AGENTS.md requires."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -950,6 +1029,35 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             result["link"] = written.get("link")
             result["modified"] = written.get("modified")
             return ok(result)
+
+        elif name == "wp_rest_request":
+            data = client.rest(
+                arguments.get("method", "GET"),
+                arguments["path"],
+                payload=arguments.get("payload"),
+                params=arguments.get("params"),
+            )
+            # WP REST errors come back as {code, message, data: {status}}; surface them as errors.
+            if (isinstance(data, dict) and data.get("code") and isinstance(data.get("data"), dict)
+                    and isinstance(data["data"].get("status"), int) and data["data"]["status"] >= 400):
+                return err(f"{data['code']}: {data.get('message')} (HTTP {data['data']['status']})")
+            return ok(data)
+
+        elif name == "wp_plugin_settings_get":
+            adapter = get_adapter(arguments["plugin"])
+            return ok(adapter.get(client, group=arguments.get("group"), keys=arguments.get("keys")))
+
+        elif name == "wp_plugin_settings_update":
+            adapter = get_adapter(arguments["plugin"])
+            return ok(adapter.update(
+                client,
+                arguments["changes"],
+                dry_run=bool(arguments.get("dry_run", True)),
+                fix_line_breaks=bool(arguments.get("fix_line_breaks", False)),
+            ))
+
+        elif name == "wp_request_count":
+            return ok({"site": client.base, "requests_sent": client.request_count})
 
         else:
             return err(f"Unknown tool: {name}")

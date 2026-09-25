@@ -5,9 +5,9 @@
 <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg?style=flat-square" alt="Python 3.9+">
 <a href="https://github.com/jimsimoy/wordpress-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License: MIT"></a>
 <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-green.svg?style=flat-square" alt="MCP Compatible"></a>
-<img src="https://img.shields.io/badge/tools-22-brightgreen.svg?style=flat-square" alt="22 Tools">
+<img src="https://img.shields.io/badge/tools-26-brightgreen.svg?style=flat-square" alt="26 Tools">
 
-**22 tools for managing WordPress sites — users, posts/pages, media, ACF, and writable Elementor layouts — over the WP REST API, for any MCP client.**
+**26 tools for managing WordPress sites — users, posts/pages, media, ACF, plugin settings, writable Elementor layouts, and any other REST route — over the WP REST API, for any MCP client.**
 
 by [Jan Ivan Simoy](https://github.com/jimsimoy)
 
@@ -19,7 +19,7 @@ by [Jan Ivan Simoy](https://github.com/jimsimoy)
 
 WordPress MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes WordPress site management over the WP REST API. One server instance manages one WordPress site — pick which site by pointing `--config` at that site's config file, so a single MCP client can run several instances for several sites.
 
-Beyond the standard content-management surface, it can read, back up, and write **Elementor** page layouts directly — something most WordPress tooling doesn't expose, because Elementor registers those fields for REST itself rather than through a public API.
+Beyond the standard content-management surface, it can read, back up, and write **Elementor** page layouts directly — something most WordPress tooling doesn't expose, because Elementor registers those fields for REST itself rather than through a public API. It can also reach **any other REST route** a plugin exposes, and change plugin settings safely through per-plugin adapters that handle the read-modify-write traps those routes tend to have.
 
 ---
 
@@ -33,6 +33,9 @@ Beyond the standard content-management surface, it can read, back up, and write 
 | **ACF Fields** | 2 | Read/write [ACF](https://www.advancedcustomfields.com/) field data where REST-exposed |
 | **Media** | 5 | List, get, find by filename, upload, delete |
 | **Elementor** | 4 | Read a layout, back it up, clear the CSS cache, and deploy a layout between environments with attachment IDs remapped |
+| **Generic REST** | 1 | Call any other REST route a plugin exposes |
+| **Plugin Settings** | 2 | Read/change a plugin's settings safely through a per-plugin adapter |
+| **Diagnostics** | 1 | How many requests this server has sent to the site so far |
 
 <details>
 <summary>Full tool reference</summary>
@@ -48,6 +51,9 @@ Beyond the standard content-management surface, it can read, back up, and write 
 | `wp_backup_elementor_page` | Save a page's current Elementor layout and settings to a timestamped local JSON file before any overwrite |
 | `wp_clear_elementor_cache` | Clear Elementor's generated CSS cache site-wide — required after writing `_elementor_page_settings` |
 | `wp_deploy_elementor_page` | Deploy a layout to a page: back up what's there, upload media, remap attachment IDs/URLs for the target site, validate, then write |
+| `wp_rest_request` | Generic authenticated call to any REST route on the site (a plugin's own namespace, or a core route the tools above don't cover). Route only; the `/wp-json` prefix is added and full URLs, query strings in the path and traversal are refused |
+| `wp_plugin_settings_get` / `wp_plugin_settings_update` | Read and safely change a plugin's settings through a per-plugin adapter (see [Plugin settings adapters](#plugin-settings-adapters)). `update` is a dry run unless you pass `dry_run: false` |
+| `wp_request_count` | How many HTTP requests this server has sent to the site so far, login included, so the count AGENTS.md asks for after touching a live or staging site is a lookup |
 
 </details>
 
@@ -78,6 +84,36 @@ See [ELEMENTOR_FINDINGS.md](ELEMENTOR_FINDINGS.md) for the underlying research t
 
 ---
 
+## Plugin settings adapters
+
+Plenty of plugins keep their settings behind their own REST routes, and those routes rarely behave
+like "PATCH these keys". Typical traps: a save **replaces** the stored object from what you send plus
+the plugin's *defaults* (so a partial POST silently resets everything else), read-only counters come
+back in the GET and must not be posted, text fields are sanitised in ways that change line breaks, and
+even a read can have a side effect. An adapter is where one plugin's route shape and its traps live,
+behind one interface:
+
+- `wp_plugin_settings_get(plugin, group?, keys?)` — no `group` lists the groups (no request sent).
+- `wp_plugin_settings_update(plugin, changes, dry_run=true, fix_line_breaks=false)` — `changes` is
+  `{group: {setting: value}}`. The adapter reads the full current object, rejects unknown keys and
+  wrong-typed values, changes only what you asked, saves the whole object back, and verifies the result
+  from the plugin's own save response. The dry run shows the exact plan and writes nothing. Both report
+  `requests_sent`.
+
+Adapters so far:
+
+| `plugin` | Covers |
+|---|---|
+| `wcdn` | Print Invoice & Delivery Notes for WooCommerce v7+: `settings` and `templates.<document>` |
+
+To add one, subclass `SettingsAdapter` in `plugin_settings/`, register it in
+`plugin_settings/__init__.py`, and test it against a fake client — `tests/test_wcdn_adapter.py` shows the
+pattern (the fake reproduces the plugin's quirks, so the tests fail if the adapter stops handling them).
+`plugin_settings/wcdn.py` documents each quirk it handles and how it was found. For anything an adapter
+doesn't cover yet, `wp_rest_request` reaches any route — read the object first and send it back whole.
+
+---
+
 ## Auth modes
 
 Two, and which you need depends on how the site is protected.
@@ -90,6 +126,13 @@ Two, and which you need depends on how the site is protected.
 **Application passwords cannot be used behind HTTP Basic auth.** Both rely on the `Authorization: Basic` header and the basic-auth layer consumes it first. That is what `cookie` mode exists for — it logs in via the form and authenticates with a REST nonce, leaving `Authorization` free for htpasswd.
 
 `wp_login_url` covers sites that move or hide `wp-login.php` (WPS Hide Login and similar); give it the slug or a full URL. Cookie logins also append a cache-buster automatically, because managed hosts will serve a cached login page with `Set-Cookie` stripped — see [AGENTS.md](AGENTS.md) for why that surfaces as a misleading "Incorrect username or password".
+
+### Safety rails (optional, per site)
+
+| Key | Default | Effect |
+|---|---|---|
+| `read_only` | `false` | Refuse every request that is not a `GET`, whichever tool sends it. Set it on live sites you only need to inspect. |
+| `request_delay` | `0` | Minimum seconds between requests, login included. Set e.g. `4` on staging so multi-request tools stay paced, as AGENTS.md asks. |
 
 ---
 
@@ -154,6 +197,17 @@ This starts an MCP server over stdio. Point an MCP client at it, e.g.:
 
 ---
 
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+No network and no WordPress needed: the client guards (path validation, `read_only`, pacing, request
+counting) and the adapters are tested against fakes.
+
+---
+
 ## Notes
 
 - ACF tools only work if the target field group(s) have `show_in_rest` enabled; otherwise the tools report that no ACF data is visible rather than guessing.
@@ -163,9 +217,10 @@ This starts an MCP server over stdio. Point an MCP client at it, e.g.:
 ## Project Structure
 
 ```
-server.py       # MCP server entry point and tool definitions
-wp_client.py    # WordPress REST API client
-configs/        # Per-site config files (gitignored)
+server.py            # MCP server entry point and tool definitions
+wp_client.py          # WordPress REST API client
+plugin_settings/      # Per-plugin settings adapters
+configs/               # Per-site config files (gitignored)
 ```
 
 The server communicates over stdio using JSON-RPC 2.0, the standard MCP transport.

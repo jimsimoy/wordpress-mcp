@@ -105,5 +105,26 @@ class CountingAndPacingTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+
+class SetElementorTemplateTypeTests(unittest.TestCase):
+    """set_elementor must not turn a saved Elementor template into a page document."""
+
+    def _meta_sent(self, post_type, **kwargs):
+        client = make_client()
+        with mock.patch.object(WPClient, "update_post", return_value={"id": 1}) as update:
+            client.set_elementor(post_type, 1, [], allow_unbacked=True, **kwargs)
+        return update.call_args.kwargs["meta"]
+
+    def test_pages_still_default_to_wp_page(self):
+        self.assertEqual(self._meta_sent("pages")["_elementor_template_type"], "wp-page")
+
+    def test_saved_templates_keep_their_type_when_none_is_given(self):
+        self.assertNotIn("_elementor_template_type", self._meta_sent(wp_client.ELEMENTOR_TEMPLATE_POST_TYPE))
+
+    def test_explicit_template_type_is_written(self):
+        meta = self._meta_sent(wp_client.ELEMENTOR_TEMPLATE_POST_TYPE, template_type="container")
+        self.assertEqual(meta["_elementor_template_type"], "container")
+
+
 if __name__ == "__main__":
     unittest.main()

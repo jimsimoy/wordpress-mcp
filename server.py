@@ -26,7 +26,7 @@ from mcp.types import (
     CallToolResult,
 )
 
-from wp_client import WPClient
+from wp_client import ELEMENTOR_TEMPLATE_POST_TYPE, WPClient
 import elementor_deploy as ed
 from plugin_settings import adapter_slugs, get_adapter, ADAPTERS
 
@@ -525,10 +525,41 @@ async def list_tools() -> list[Tool]:
                     },
                     "backup_dir":   {"type": "string"},
                     "source_host":  {"type": "string", "description": "Host in the incoming layout, e.g. 'mysite.local'"},
-                    "template":     {"type": "string", "default": "elementor_canvas"},
+                    "template":     {"type": "string", "default": "elementor_canvas",
+                                     "description": ("Page template to set. Defaults to elementor_canvas for pages; "
+                                                     "for post_type 'elementor_library' (saved templates) nothing is set "
+                                                     "unless given.")},
+                    "template_type": {"type": "string",
+                                      "description": ("Elementor document type to write (e.g. 'container', 'section', "
+                                                      "'page'). Omit to keep a saved template's existing type; pages "
+                                                      "default to 'wp-page'.")},
                     "status":       {"type": "string"},
                     "dry_run":      {"type": "boolean", "default": False,
                                      "description": "Upload and remap, report what would change, but do not write the page."},
+                },
+            },
+        ),
+        Tool(
+            name="wp_create_elementor_template",
+            description=(
+                "Create an Elementor saved template (Templates > Saved Templates, post type elementor_library) "
+                "and deploy a layout into it through the same path as wp_deploy_elementor_page: media upload, "
+                "id/url remap, validation, cache clear. Use it to put a shared template (embedded in pages with "
+                "the Template widget) onto a new environment; update it later with wp_deploy_elementor_page "
+                "and post_type 'elementor_library'. Note: REST cannot set the elementor_library_type term that "
+                "the Templates screen filters on; the template works without it but may only list under 'All' "
+                "unless the site syncs the term from _elementor_template_type."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["title", "template_type", "payload_file", "backup_dir"],
+                "properties": {
+                    "title":         {"type": "string"},
+                    "template_type": {"type": "string", "description": "e.g. 'container', 'section' or 'page'"},
+                    "payload_file":  {"type": "string", "description": "Same format as wp_deploy_elementor_page"},
+                    "backup_dir":    {"type": "string"},
+                    "source_host":   {"type": "string"},
+                    "status":        {"type": "string", "default": "publish"},
                 },
             },
         ),
@@ -1002,17 +1033,20 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 return ok(result)
 
             # 4. write
+            is_template = post_type == ELEMENTOR_TEMPLATE_POST_TYPE
             settings = dict(current.get("page_settings") or {})
             if payload.get("custom_css") is not None:
                 settings["custom_css"] = payload["custom_css"]
-            settings.setdefault("hide_title", "yes")
+            if not is_template:
+                settings.setdefault("hide_title", "yes")
 
             # allow_unbacked: step 1 above already wrote `backup` for this page, so the
             # client-side guard would only re-read the layout to prove what we just saved.
             written = client.set_elementor(post_type, post_id, remapped, page_settings=settings,
-                                           template=arguments.get("template", "elementor_canvas"),
+                                           template=arguments.get("template", None if is_template else "elementor_canvas"),
                                            status=arguments.get("status"),
-                                           allow_unbacked=True)
+                                           allow_unbacked=True,
+                                           template_type=arguments.get("template_type"))
             if isinstance(written, dict) and written.get("code"):
                 return err(f"Write failed (backup kept at {backup}): {written.get('message')}")
 
@@ -1029,6 +1063,30 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             result["link"] = written.get("link")
             result["modified"] = written.get("modified")
             return ok(result)
+
+        elif name == "wp_create_elementor_template":
+            created = client.create_post(
+                ELEMENTOR_TEMPLATE_POST_TYPE,
+                title=arguments["title"],
+                status=arguments.get("status", "publish"),
+                meta={"_elementor_template_type": arguments["template_type"],
+                      "_elementor_edit_mode": "builder",
+                      "_elementor_data": "[]"},
+            )
+            if isinstance(created, dict) and created.get("code"):
+                return err(created.get("message", str(created)))
+            deployed = await call_tool("wp_deploy_elementor_page", {
+                "post_type":     ELEMENTOR_TEMPLATE_POST_TYPE,
+                "post_id":       created["id"],
+                "payload_file":  arguments["payload_file"],
+                "backup_dir":    arguments["backup_dir"],
+                "source_host":   arguments.get("source_host"),
+                "template_type": arguments["template_type"],
+            })
+            if deployed.isError:
+                return err(f"Template {created['id']} was created but the layout write failed: "
+                           f"{deployed.content[0].text}")
+            return ok({"template_id": created["id"], "deploy": json.loads(deployed.content[0].text)})
 
         elif name == "wp_rest_request":
             data = client.rest(

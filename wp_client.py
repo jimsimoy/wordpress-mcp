@@ -21,6 +21,9 @@ import urllib.parse
 import urllib.request
 import warnings
 
+# REST base of Elementor saved templates (Templates > Saved Templates).
+ELEMENTOR_TEMPLATE_POST_TYPE = "elementor_library"
+
 warnings.filterwarnings("ignore")
 
 
@@ -402,18 +405,28 @@ class WPClient:
 
     def set_elementor(self, post_type: str, post_id: int, layout, page_settings: dict = None,
                       template: str = None, status: str = None,
-                      backup_dir: str = None, allow_unbacked: bool = False) -> dict:
-        """Write a layout to a page.
+                      backup_dir: str = None, allow_unbacked: bool = False,
+                      template_type: str = None) -> dict:
+        """Write a layout to a page or an Elementor template.
 
         Overwriting an existing layout is refused unless `backup_dir` is given (the
         current layout is saved there first) or `allow_unbacked=True`. Prefer
         `wp_deploy_elementor_page`, which backs up and remaps media for you.
+
+        `_elementor_template_type` is only written when `template_type` is given, or as
+        "wp-page" for anything that is not an Elementor template. A saved template
+        (post type `elementor_library`) carries its own type — container, section, page,
+        popup, header... — and overwriting it with "wp-page" silently turns the template
+        into a page document.
         """
         meta = {
             "_elementor_data": layout if isinstance(layout, str) else json.dumps(layout),
             "_elementor_edit_mode": "builder",
-            "_elementor_template_type": "wp-page",
         }
+        if template_type:
+            meta["_elementor_template_type"] = template_type
+        elif post_type != ELEMENTOR_TEMPLATE_POST_TYPE:
+            meta["_elementor_template_type"] = "wp-page"
         if page_settings is not None:
             meta["_elementor_page_settings"] = page_settings
         fields = {"meta": meta}

@@ -158,7 +158,14 @@ class WPClient:
                 final_url = r.geturl()
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"WP login failed (HTTP {e.code}). Check wp_user / wp_password.")
-        if "wp-login" in final_url or final_url.rstrip("/") == login_url.rstrip("/"):
+        # WordPress sends admins to wp-login.php?action=confirm_admin_email every few months
+        # after a successful login. The auth cookie is already set at that point, so it is
+        # not a failed login; treating it as one blocks every REST call until someone
+        # confirms the address in a browser.
+        login_ok_interstitial = "action=confirm_admin_email" in final_url
+        if not login_ok_interstitial and (
+            "wp-login" in final_url or final_url.rstrip("/") == login_url.rstrip("/")
+        ):
             raise RuntimeError(
                 "WP login failed — ended up back at the login page. Check wp_user / "
                 "wp_password, and wp_login_url if the site hides wp-login.php."

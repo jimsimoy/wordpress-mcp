@@ -70,6 +70,7 @@ def normalise_rest_path(path: str) -> str:
 class WPClient:
     def __init__(self, config: dict):
         self.base  = config["wp_url"].rstrip("/")
+        self.admin_url = config.get("wp_admin_url", self.base + "/wp-admin").rstrip("/")
         self._ssl  = ssl._create_unverified_context()
         self._opener = None
         self._user_agent = config.get("user_agent", DEFAULT_USER_AGENT)
@@ -248,6 +249,56 @@ class WPClient:
                 return json.loads(body)
             except Exception:
                 raise RuntimeError(f"HTTP {e.code} {path}: {body[:300]}")
+
+    # ── wp-admin (cookie mode only) ───────────────────────────────────────────
+    # Some plugins save their settings only through admin-ajax with a nonce printed on their admin
+    # screen, with no REST route at all. These two calls cover that: read the screen, post the form.
+    # Both go through the same rails as request(): read_only, request_delay and request_count.
+
+    def _require_cookie_session(self):
+        if not self._opener:
+            raise RuntimeError("This needs a logged-in admin session: set wp_auth_mode to 'cookie' in the site config.")
+
+    def admin_get(self, page: str, params: dict = None) -> str:
+        """GET a screen under wp-admin (e.g. 'edit.php') and return its HTML."""
+        self._require_cookie_session()
+        if not re.fullmatch(r"[a-z0-9_-]+\.php", page or ""):
+            raise ValueError("page must be a wp-admin script name such as 'edit.php'")
+        url = f"{self.admin_url}/{page}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        self._before_request()
+        req = urllib.request.Request(url, headers={k: v for k, v in self.headers.items() if k != "Content-Type"})
+        with self._opener.open(req) as r:
+            final = r.geturl()
+            html = r.read().decode(errors="replace")
+        if "wp-login.php" in final:
+            raise RuntimeError("The admin session has expired (redirected to wp-login). Restart the server to log in again.")
+        return html
+
+    def admin_ajax(self, fields) -> dict:
+        """POST form fields (a list of (name, value) pairs, order and repeats kept) to admin-ajax.php."""
+        self._require_cookie_session()
+        if self._read_only:
+            raise RuntimeError("This site's config is read_only: refusing POST admin-ajax.php.")
+        data = urllib.parse.urlencode(list(fields)).encode()
+        hdrs = {k: v for k, v in self.headers.items() if k not in ("Content-Type", "X-WP-Nonce")}
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        hdrs["X-Requested-With"] = "XMLHttpRequest"
+        self._before_request()
+        req = urllib.request.Request(f"{self.admin_url}/admin-ajax.php", data=data, headers=hdrs, method="POST")
+        try:
+            with self._opener.open(req) as r:
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code} admin-ajax.php: {e.read()[:300]!r}")
+        text = body.decode(errors="replace").strip()
+        if text in ("-1", "0"):
+            raise RuntimeError(f"admin-ajax.php answered {text}: the nonce was rejected or the user lacks the capability.")
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise RuntimeError(f"admin-ajax.php did not answer JSON: {text[:300]}")
 
     # ── Users ──────────────────────────────────────────────────────────────────
 

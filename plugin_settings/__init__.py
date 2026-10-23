@@ -1,9 +1,10 @@
 """Registry of plugin settings adapters. Add new adapters here."""
 
 from .base import SettingsAdapter, SettingsError
+from .geodir_search import GeodirSearchAdapter
 from .wcdn import WcdnAdapter
 
-ADAPTERS = {a.slug: a for a in (WcdnAdapter(),)}
+ADAPTERS = {a.slug: a for a in (GeodirSearchAdapter(), WcdnAdapter())}
 
 
 def adapter_slugs():

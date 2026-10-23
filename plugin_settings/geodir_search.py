@@ -21,6 +21,10 @@ Behaviour that is easy to get wrong, all handled here (found against a real inst
   and replaced with 10, 50 and 10 ("Less than 10" on a 0-5 field). update() warns about both before writing.
 * The form always carries range_mode=1 (a hidden input), whatever is stored; so does a save from the
   admin screen. It only changes the output when range_step is 1 (single values instead of bands).
+* A save without a sort_order moves the field to the END of the list (the plugin gives it MAX(sort_order)
+  + 1); the admin screen hides this by saving the whole list order right after every field save. update()
+  does the same with the order it read before writing, and verifies the order afterwards. A post type's
+  order can also be set on its own with {"<post_type>": {"_order": [field ids, top to bottom]}}.
 * Deleting a field cannot be undone. It only happens when the change for that field is exactly
   {"delete": true}.
 """
@@ -97,6 +101,7 @@ class _ScreenParser(HTMLParser):
         super().__init__(convert_charrefs=False)
         self.nonce = None
         self.templates = {}       # id -> template markup
+        self.order = []           # (id, depth, parent id) in screen order, i.e. by sort_order
         self._li_stack = []       # field id (or None) per open <li>
         self._capture = None      # field id whose template is being read
         self._buf = []
@@ -111,6 +116,9 @@ class _ScreenParser(HTMLParser):
         a = dict(attrs)
         if tag == "li":
             m = re.fullmatch(r"setName_(\d+)", a.get("id") or "")
+            if m:
+                ancestors = [f for f in self._li_stack if f is not None]
+                self.order.append((m.group(1), len(ancestors), ancestors[-1] if ancestors else "0"))
             self._li_stack.append(m.group(1) if m else None)
         elif tag == "input" and a.get("id") == NONCE_ID:
             self.nonce = a.get("value")
@@ -133,6 +141,12 @@ class _ScreenParser(HTMLParser):
 
 def parse_screen(html):
     """Return (nonce, {field_id: [(name, value), ...]}) from the CPT search settings screen."""
+    nonce, fields, _ = parse_screen_with_order(html)
+    return nonce, fields
+
+
+def parse_screen_with_order(html):
+    """parse_screen() plus the field order: [(field_id, depth, parent_id), ...] top to bottom."""
     screen = _ScreenParser()
     screen.feed(html)
     screen.close()
@@ -142,7 +156,15 @@ def parse_screen(html):
         inputs.feed(markup)
         inputs.close()
         fields[fid] = inputs.pairs
-    return screen.nonce, fields
+    return screen.nonce, fields, screen.order
+
+
+def order_pairs(order):
+    """The form the plugin's geodir_cpt_search_save_order action expects; list position becomes sort_order."""
+    pairs = []
+    for i, (fid, depth, parent) in enumerate(order, 1):
+        pairs += [(f"fields[{i}][id]", fid), (f"fields[{i}][tab_level]", str(depth)), (f"fields[{i}][tab_parent]", parent)]
+    return pairs
 
 
 def effective(pairs):
@@ -199,11 +221,11 @@ class GeodirSearchAdapter(SettingsAdapter):
     @staticmethod
     def _read(client, post_type):
         html = client.admin_get("edit.php", {"post_type": post_type, "page": f"{post_type}-settings", "tab": "cpt-search"})
-        nonce, fields = parse_screen(html)
+        nonce, fields, order = parse_screen_with_order(html)
         if not nonce:
             raise SettingsError(f"No search settings screen for {post_type!r} (no {NONCE_ID} on the page). "
                                 "Is it a GeoDirectory post type, and is Advanced Search Filters active?")
-        return nonce, fields
+        return nonce, fields, order
 
     @staticmethod
     def _resolve(post_type, ref, fields):
@@ -228,7 +250,7 @@ class GeodirSearchAdapter(SettingsAdapter):
             }
         self._validate_group(group)
         before = client.request_count
-        _, fields = self._read(client, group)
+        _, fields, _ = self._read(client, group)
         values = {fid: effective(pairs) for fid, pairs in fields.items()}
         if keys:
             values = {self._resolve(group, k, fields): values[self._resolve(group, k, fields)] for k in keys}
@@ -245,11 +267,23 @@ class GeodirSearchAdapter(SettingsAdapter):
         report = {"plugin": self.slug, "dry_run": bool(dry_run), "changes": [], "applied": [],
                   "verified": None, "warnings": []}
         plan = []        # (post_type, nonce, field_id, new_pairs | None for delete, wanted)
+        orders = {}      # post_type -> (nonce, order to save after the field saves)
         for post_type, per_field in changes.items():
             self._validate_group(post_type)
             if not isinstance(per_field, dict) or not per_field:
                 raise SettingsError(f"changes[{post_type!r}] must map a field id or htmlvar_name to settings")
-            nonce, fields = self._read(client, post_type)
+            nonce, fields, order = self._read(client, post_type)
+            orders[post_type] = (nonce, order)
+            if "_order" in per_field:
+                wanted_ids = [str(x) for x in per_field["_order"]]
+                if sorted(wanted_ids) != sorted(f for f, _, _ in order):
+                    raise SettingsError(f"{post_type}: _order must list every field id once: {', '.join(f for f, _, _ in order)}")
+                if wanted_ids != [f for f, _, _ in order]:
+                    report["changes"].append({"group": post_type, "field": "(all)", "htmlvar_name": None, "key": "order",
+                                              "old": [f for f, _, _ in order], "new": wanted_ids})
+                    by_id = {f: (f, d, par) for f, d, par in order}
+                    orders[post_type] = (nonce, [by_id[f] for f in wanted_ids], True)
+                per_field = {k: v for k, v in per_field.items() if k != "_order"}
             for ref, kv in per_field.items():
                 fid = self._resolve(post_type, ref, fields)
                 current = effective(fields[fid])
@@ -283,7 +317,8 @@ class GeodirSearchAdapter(SettingsAdapter):
             report["message"] = "Nothing to change - the requested values are already set."
         elif dry_run:
             report["message"] = "Dry run - nothing written. Call again with dry_run=false to apply."
-        if dry_run or not plan:
+        reorder_only = [pt for pt, o in orders.items() if len(o) == 3]
+        if dry_run or not (plan or reorder_only):
             report["requests_sent"] = client.request_count - before
             return report
 
@@ -299,9 +334,25 @@ class GeodirSearchAdapter(SettingsAdapter):
                 break        # never carry on writing after a failure
             report["applied"].append(f"{post_type}#{fid}")
 
+        # Put the order back (or set the requested one): a field save moves the field to the end of the list.
+        deleted = {(p[0], p[2]) for p in plan if p[3] is None and f"{p[0]}#{p[2]}" in report["applied"]}
+        touched = list(dict.fromkeys([p[0] for p in plan if f"{p[0]}#{p[2]}" in report["applied"]] + reorder_only))
+        expected = {}
+        if not problems:
+            for post_type in touched:
+                nonce, order = orders[post_type][:2]
+                order = [o for o in order if (post_type, o[0]) not in deleted]
+                expected[post_type] = [o[0] for o in order]
+                resp = client.admin_ajax(order_pairs(order) + [("security", nonce), ("action", "geodir_cpt_search_save_order")])
+                if not (isinstance(resp, dict) and resp.get("success")):
+                    problems.append(f"{post_type}: the plugin refused the field order: {str(resp)[:200]}")
+                    break
+
         # Verify from a fresh read of each touched screen, not from the save responses.
-        for post_type in dict.fromkeys(p[0] for p in plan):
-            _, fields = self._read(client, post_type)
+        for post_type in touched:
+            _, fields, order = self._read(client, post_type)
+            if post_type in expected and [o[0] for o in order] != expected[post_type]:
+                problems.append(f"{post_type}: field order is {[o[0] for o in order]}, wanted {expected[post_type]}")
             for pt, _, fid, new_pairs, wanted in plan:
                 if pt != post_type or f"{pt}#{fid}" not in report["applied"]:
                     continue

@@ -1,7 +1,8 @@
 """
 geodir-search adapter tests. No network: a fake client serves a cut-down copy of the CPT search settings
 screen (fields as <script type="text/template" class="dd-setting"> inside <li id="setName_<id>">) and
-plays the plugin's admin-ajax save/delete, which rebuild the row from whatever was POSTed.
+plays the plugin's admin-ajax save/delete, which rebuild the row from whatever was POSTed. Like the plugin,
+a field save moves the field to the end of the list (no sort_order in the form) and the order save reorders.
 """
 import os
 import sys
@@ -51,6 +52,7 @@ class FakeSite:
         self.request_count = 0
         self.posts = []
         self.refuse = False
+        self.order_saves = []
 
     def screen(self):
         lis = "".join(field_li(*args) for args in self.rows.values())
@@ -71,6 +73,11 @@ class FakeSite:
         if post["action"] == "geodir_cpt_search_delete_field":
             del self.rows[post["id"]]
             return {"success": True, "data": True}
+        if post["action"] == "geodir_cpt_search_save_order":
+            ids = [v for k, v in fields if k.endswith("[id]")]
+            self.order_saves.append(ids)
+            self.rows = {i: self.rows[i] for i in ids}
+            return {"success": True, "data": True}
         fid = post["field_id"]
         old = self.rows[fid]
         self.rows[fid] = (fid, post["htmlvar_name"], post["frontend_title"], post["input_type"],
@@ -78,6 +85,7 @@ class FakeSite:
                           post.get("range_max", old[5] if len(old) > 5 else "100000"),
                           post.get("range_step", old[6] if len(old) > 6 else "10000"),
                           post["main_search"] == "1")
+        self.rows[fid] = self.rows.pop(fid)      # the plugin gives a saved field MAX(sort_order) + 1
         return {"success": True, "data": "<li>...</li>"}
 
 
@@ -139,7 +147,28 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(post["frontend_title"], "Price")
         self.assertEqual(self.site.rows["1"][4], "10000")
         self.assertEqual(r["warnings"], [])
-        self.assertEqual(r["requests_sent"], 3)             # read, save, re-read
+        self.assertEqual(r["requests_sent"], 4)             # read, save, order, re-read
+
+    def test_field_save_keeps_the_order(self):
+        r = self.a.update(self.site, {"gd_place": {"1": {"range_min": 10000}, "4": {"range_min": 1}}}, dry_run=False)
+        self.assertTrue(r["verified"], r)
+        self.assertEqual(list(self.site.rows), ["1", "2", "3", "4"])
+        self.assertEqual(self.site.order_saves, [["1", "2", "3", "4"]])
+
+    def test_delete_then_order_without_the_deleted_field(self):
+        r = self.a.update(self.site, {"gd_place": {"3": {"delete": True}, "1": {"range_min": 10000}}}, dry_run=False)
+        self.assertTrue(r["verified"], r)
+        self.assertEqual(list(self.site.rows), ["1", "2", "4"])
+
+    def test_set_order_on_its_own(self):
+        r = self.a.update(self.site, {"gd_place": {"_order": ["4", "1", "2", "3"]}})
+        self.assertEqual(r["changes"][0]["key"], "order")
+        self.assertEqual(self.site.order_saves, [])           # dry run
+        r = self.a.update(self.site, {"gd_place": {"_order": [4, 1, 2, 3]}}, dry_run=False)
+        self.assertTrue(r["verified"], r)
+        self.assertEqual(list(self.site.rows), ["4", "1", "2", "3"])
+        with self.assertRaises(SettingsError):
+            self.a.update(self.site, {"gd_place": {"_order": ["4", "1"]}})
 
     def test_checkbox_pair_both_take_new_value(self):
         self.a.update(self.site, {"gd_place": {"2": {"main_search": "1"}}}, dry_run=False)
